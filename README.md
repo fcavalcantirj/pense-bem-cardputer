@@ -35,6 +35,24 @@ Claude takes over from there.
 
 Done. Power the device on/off with the side switch.
 
+## Cardputer-Adv verification (2026-08-20)
+
+The Pense Bem delivery lane was verified on a physical Cardputer-Adv:
+
+- USB: ESP32-S3 native USB-JTAG, VID `0x303A`
+- Firmware: UIFlow2 v2.5.1, MicroPython v1.27.0-dirty (2026-08-18)
+- Launcher: boots, attempts the bundled event WiFi, and continues offline when that network is unavailable
+- Apps/input: Claude Buddy and Snake launch and respond to the keyboard
+- HTTP: `requests2` imports successfully from the firmware
+- Speaker: `M5.Speaker.tone(1000, 150)` produces an audible beep
+- Keyboard API: the bundled apps document integer key codes on this build and normalize both integer and string returns; two direct REPL captures timed out while the launcher was interrupted, so application-level input is the verified observable
+
+On this macOS host, esptool 5.3.1 lost the native USB link during the
+full-flash write and left a digest mismatch. Repeating the same flow with
+esptool 4.12.0 completed all 8,384,512 bytes and printed `Hash of data
+verified.` The requirements therefore keep the supported 4.x line until the
+5.x native-USB path is independently proven here.
+
 ---
 
 ## Using Claude Buddy (BLE)

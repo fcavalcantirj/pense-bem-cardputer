@@ -15,4 +15,4 @@
 #
 # To install everything explicitly (CI, reproducible setup):
 #   python3 -m pip install --user -r requirements.txt
-esptool>=4.11
+esptool>=4.11,<5
