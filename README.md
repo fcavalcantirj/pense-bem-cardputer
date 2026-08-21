@@ -28,7 +28,7 @@ Flash a Cardputer-Adv and install the complete app bundle in one guided command.
 
 1. Clone this repo locally — anywhere is fine:
    ```bash
-   git clone <repo-url>
+   git clone https://github.com/fcavalcantirj/pense-bem-cardputer.git
    ```
    The skill auto-detects the buddy bundle relative to its own install location, so the clone path doesn't matter. `~/Downloads/m5stack/` and `~/Desktop/m5stack/` are also checked as conventional fallbacks.
 2. Plug the Cardputer into your laptop via USB-C
