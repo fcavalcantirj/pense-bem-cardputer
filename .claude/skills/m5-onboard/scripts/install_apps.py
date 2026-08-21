@@ -71,9 +71,8 @@ def _paste_or_raise(s, script: str, settle: float = 0.3, what: str = "paste") ->
 
 
 def _set_user_app_boot_mode(s) -> None:
-    """Set NVS ``uiflow.boot_option`` to 2 (user-app mode) so UIFlow's
-    stock boot.py runs our ``/flash/main.py`` instead of starting its
-    framework.
+    """Set NVS ``uiflow.boot_option`` to 0 so UIFlow's stock boot.py
+    returns to our ``/flash/main.py`` without its launcher or network phase.
 
     Why this matters: with ``boot_option=1`` (the default on a freshly
     flashed device), UIFlow starts a background BLE advertise for
@@ -82,9 +81,12 @@ def _set_user_app_boot_mode(s) -> None:
     subsequent ``gap_advertise(adv_data=...)`` call from user code
     returns ``OSError(-519)`` — the device advertises with empty AD
     fields and is invisible to strict scanners (iOS Bluetooth,
-    desktop Claude Buddy app). Setting ``boot_option=2`` makes
-    UIFlow's boot.py hand straight to ``/flash/main.py`` without
-    touching BLE itself, leaving the stack pristine for our code.
+    desktop Claude Buddy app). UIFlow 2.5.1 defines option 0 as
+    ``BOOT_OPT_NOTHING`` and option 2 as ``BOOT_OPT_NETWORK``. Option 2
+    connects UIFlow's saved network before main.py; on Cardputer-Adv that
+    pre-main path was physically observed to leave the custom launcher's
+    keyboard unresponsive. Option 0 avoids both stock BLE and stock network,
+    leaving those subsystems to the selected app.
 
     We only call this when the bundle ships a ``main.py`` at root —
     those are bundles that want to own the boot flow entirely. A
@@ -98,14 +100,14 @@ def _set_user_app_boot_mode(s) -> None:
         "    cur = nvs.get_u8('boot_option')\n"
         "except Exception:\n"
         "    cur = None\n"
-        "if cur != 2:\n"
-        "    nvs.set_u8('boot_option', 2)\n"
+        "if cur != 0:\n"
+        "    nvs.set_u8('boot_option', 0)\n"
         "    nvs.commit()\n"
-        "    print('BOOT_OPTION_SET 2 (was', cur, ')')\n"
+        "    print('BOOT_OPTION_SET 0 (was', cur, ')')\n"
         "else:\n"
-        "    print('BOOT_OPTION_ALREADY 2')\n"
+        "    print('BOOT_OPTION_ALREADY 0')\n"
     )
-    out = _paste_or_raise(s, script, settle=0.3, what="set boot_option=2")
+    out = _paste_or_raise(s, script, settle=0.3, what="set boot_option=0")
     if "BOOT_OPTION_SET" not in out and "BOOT_OPTION_ALREADY" not in out:
         raise RuntimeError("boot_option set didn't confirm:\n" + out)
     # Surface the outcome to the user — quietly changing NVS state is
@@ -341,9 +343,8 @@ def install(
 
         # If the bundle ships its own main.py at /flash/, that's a
         # signal it wants to own the boot flow. Set UIFlow's NVS
-        # boot_option to 2 (user-app mode) so UIFlow's boot.py runs
-        # our main.py directly instead of its own framework — the
-        # latter touches BLE and wedges the controller on ESP32-S3.
+        # boot_option to 0 so UIFlow's boot.py returns to our main.py
+        # without starting its BLE launcher or pre-main network phase.
         # See _set_user_app_boot_mode docstring for the gory details.
         owns_launcher = "main.py" in root_basenames
         if owns_launcher:

@@ -20,7 +20,7 @@ https://raw.githubusercontent.com/m5stack/uiflow-micropython/master/m5stack/modu
 
 | Key           | Type | Example value | Notes |
 |---------------|------|---------------|-------|
-| `boot_option` | u8   | `2`           | 0 = factory test, 1 = UIFlow launcher, 2 = run `/flash/main.py`. `install_apps.py` sets this to `2` when the bundle ships a root `main.py` so our launcher takes the boot flow instead of UIFlow's pairing screen. |
+| `boot_option` | u8   | `0`           | Current UIFlow source: 0 = return to `/flash/main.py` without UIFlow network/menu, 1 = stock menu + network, 2 = network-only setup before `main.py`. `install_apps.py` sets 0 for a root custom launcher. |
 
 ## Failure modes
 
@@ -65,7 +65,7 @@ import esp32
 nvs = esp32.NVS("uiflow")
 try: nvs.erase_key("boot_option")
 except Exception: pass
-nvs.set_u8("boot_option", 2)
+nvs.set_u8("boot_option", 0)
 nvs.commit()
 print("NVS-OK")
 ```

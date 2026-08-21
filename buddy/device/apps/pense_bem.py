@@ -18,6 +18,8 @@ in return.
 ----------------------------------------------------------------------------
 """
 
+import gc
+import sys
 import time
 
 import M5
@@ -29,6 +31,12 @@ try:
 except ImportError:
     esp32 = None
 
+try:
+    import network
+    import requests2
+except ImportError:
+    network = None
+    requests2 = None
 
 # Formula constants. These values intentionally live in this file only.
 _PB_BOOKS = 99
@@ -79,6 +87,28 @@ _END_SONGS = (
     ((440, 170), (523, 170), (440, 300)),
     ((392, 200), (330, 200), (262, 380)),
 )
+_SFX_ONLINE_COMPLETE = ((659, 110), (784, 110), (988, 150), (1319, 260))
+
+# Online protocol and fixed capacities. The server owns every online question,
+# judgment, attempt, score, and transition; these limits only reject malformed
+# or unexpectedly large responses before they reach the renderer.
+_PROTOCOL = 1
+_ONLINE_CLIENT = "atari8"
+_NVS_NAMESPACE = "pensebem"
+_NVS_SSID_KEY = "wifi_ssid"
+_NVS_PASS_KEY = "wifi_pass"
+_NVS_API_KEY = "api_url"
+_SSID_CAPACITY = 32
+_PASS_CAPACITY = 64
+_API_URL_CAPACITY = 96
+_SESSION_ID_CAPACITY = 64
+_PROMPT_CAPACITY = 240
+_OPTION_CAPACITY = 64
+_MESSAGE_CAPACITY = 160
+_ASSET_ID_CAPACITY = 32
+_MAX_ONLINE_LINES = 256
+_ONLINE_PAGE_LINES = 7
+_WIFI_TIMEOUT_MS = 15000
 
 # Display geometry and fixed palette.
 _W = 240
@@ -176,6 +206,117 @@ def _parse_code(code):
     return book, section
 
 
+class _NetworkError(Exception):
+    pass
+
+
+class _ServerError(Exception):
+    pass
+
+
+class _ProtocolError(Exception):
+    pass
+
+
+def _bounded_text(value, capacity, allow_empty=False):
+    if not isinstance(value, str):
+        raise _ProtocolError("texto invalido")
+    size = len(value.encode("utf-8"))
+    if size > capacity or (not allow_empty and size == 0):
+        raise _ProtocolError("texto fora do limite")
+    return value
+
+
+def _bounded_int(value, minimum, maximum):
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise _ProtocolError("numero invalido")
+    if value < minimum or value > maximum:
+        raise _ProtocolError("numero fora do limite")
+    return value
+
+
+def _question_from_payload(payload):
+    if not isinstance(payload, dict):
+        raise _ProtocolError("questao ausente")
+    options = payload.get("options")
+    if not isinstance(options, (list, tuple)) or len(options) != 4:
+        raise _ProtocolError("opcoes invalidas")
+    bounded_options = []
+    for option in options:
+        bounded_options.append(_bounded_text(option, _OPTION_CAPACITY))
+    asset_id = _bounded_text(
+        payload.get("asset_id", ""),
+        _ASSET_ID_CAPACITY,
+        True,
+    )
+    return {
+        "number": _bounded_int(payload.get("number"), 1, _PB_QUESTIONS),
+        "position": _bounded_int(payload.get("position"), 1, _PB_PER_SECTION),
+        "total": _bounded_int(payload.get("total"), 1, _PB_PER_SECTION),
+        "attempt": _bounded_int(payload.get("attempt"), 1, 3),
+        "text": _bounded_text(payload.get("text"), _PROMPT_CAPACITY),
+        "options": bounded_options,
+        "asset_id": asset_id,
+    }
+
+
+def _start_payload(code):
+    return {"code": code, "client": _ONLINE_CLIENT, "protocol": _PROTOCOL}
+
+
+def _answer_payload(session_id, request_id, answer):
+    return {
+        "session_id": session_id,
+        "request_id": request_id,
+        "answer": answer,
+    }
+
+
+def _parse_start_response(payload):
+    if not isinstance(payload, dict) or payload.get("protocol") != _PROTOCOL:
+        raise _ProtocolError("protocolo invalido")
+    if payload.get("complete") is not False:
+        raise _ProtocolError("sessao completa ao iniciar")
+    return {
+        "session_id": _bounded_text(
+            payload.get("session_id"),
+            _SESSION_ID_CAPACITY,
+        ),
+        "score": _bounded_int(payload.get("score"), 0, 300),
+        "question": _question_from_payload(payload.get("question")),
+    }
+
+
+def _parse_answer_response(payload, session_id, request_id):
+    if not isinstance(payload, dict) or payload.get("protocol") != _PROTOCOL:
+        raise _ProtocolError("protocolo invalido")
+    if payload.get("session_id") != session_id:
+        raise _ProtocolError("sessao divergente")
+    if payload.get("request_id") != request_id:
+        raise _ProtocolError("request id divergente")
+    result = payload.get("result")
+    if result not in ("correct", "retry", "revealed", "complete"):
+        raise _ProtocolError("resultado invalido")
+    complete = payload.get("complete")
+    if complete is not True and complete is not False:
+        raise _ProtocolError("complete invalido")
+    question = None
+    if not complete:
+        question = _question_from_payload(payload.get("question"))
+    return {
+        "result": result,
+        "points": _bounded_int(payload.get("points_awarded"), 0, 10),
+        "score": _bounded_int(payload.get("score"), 0, 300),
+        "message": _bounded_text(
+            payload.get("message", ""),
+            _MESSAGE_CAPACITY,
+            True,
+        ),
+        "complete": complete,
+        "question": question,
+    }
+
+
 def _key_char(key):
     if key is None:
         return None
@@ -236,8 +377,48 @@ def _next_key(kb):
     return ch
 
 
-def _draw_code(code, error):
-    _chrome("PENSE BEM  OFFLINE", "0-9 codigo  Enter iniciar")
+def _draw_mode(cursor):
+    _chrome("PENSE BEM", "; . escolher  Enter abrir")
+    _center("COMO JOGAR?", 29, _GRAY)
+    labels = ("OFFLINE  LIVRO", "ONLINE   API")
+    for index, label in enumerate(labels):
+        y = 55 + index * 30
+        selected = index == cursor
+        if selected:
+            _LCD.fillRect(26, y - 5, _W - 52, 24, _ORANGE)
+        _center(
+            label,
+            y,
+            _BLACK if selected else _CREAM,
+            1,
+            _ORANGE if selected else _BLACK,
+        )
+
+
+def _read_mode(kb):
+    cursor = 0
+    _draw_mode(cursor)
+    while True:
+        ch = _next_key(kb)
+        if ch is None:
+            continue
+        if _is_exit(ch):
+            return None
+        lowered = ch.lower()
+        if lowered == "o":
+            return "offline"
+        if lowered == "n":
+            return "online"
+        if ch in (";", ",", ".", "/", "w", "s"):
+            cursor = 1 - cursor
+            _draw_mode(cursor)
+        elif ch == "\n":
+            return "offline" if cursor == 0 else "online"
+
+
+def _draw_code(code, error, mode):
+    title = "PENSE BEM  " + mode.upper()
+    _chrome(title, "0-9 codigo  Enter iniciar")
     _center("CODIGO DO LIVRO", 34, _GRAY)
     shown = code + "_" * (3 - len(code))
     _center(shown, 55, _ORANGE, 2)
@@ -247,10 +428,10 @@ def _draw_code(code, error):
         _center("BBS: livro + secao", 91, _CREAM)
 
 
-def _read_code(kb):
+def _read_code(kb, mode):
     code = ""
     error = ""
-    _draw_code(code, error)
+    _draw_code(code, error, mode)
     while True:
         ch = _next_key(kb)
         if ch is None:
@@ -260,19 +441,19 @@ def _read_code(kb):
         if ch == "\b":
             code = code[:-1]
             error = ""
-            _draw_code(code, error)
+            _draw_code(code, error, mode)
         elif "0" <= ch <= "9":
             if len(code) < 3:
                 code += ch
                 error = ""
-                _draw_code(code, error)
+                _draw_code(code, error, mode)
         elif ch == "\n":
             parsed = _parse_code(code)
             if parsed is not None:
                 return code, parsed[0], parsed[1]
             error = "CODIGO INVALIDO"
             code = ""
-            _draw_code(code, error)
+            _draw_code(code, error, mode)
 
 
 def _draw_question(code, index, question, attempt, raw):
@@ -327,6 +508,362 @@ def _wait_continue(kb):
             return False
         if ch == "\n":
             return True
+
+
+def _nvs_text(key, capacity):
+    if esp32 is None:
+        return None
+    data = bytearray(capacity)
+    try:
+        length = esp32.NVS(_NVS_NAMESPACE).get_blob(key, data)
+    except Exception:
+        return None
+    if not isinstance(length, int) or length < 0 or length > capacity:
+        return None
+    try:
+        return bytes(data[:length]).decode("utf-8")
+    except Exception:
+        return None
+
+
+def _online_config():
+    ssid = _nvs_text(_NVS_SSID_KEY, _SSID_CAPACITY)
+    password = _nvs_text(_NVS_PASS_KEY, _PASS_CAPACITY)
+    api_url = _nvs_text(_NVS_API_KEY, _API_URL_CAPACITY)
+    if ssid is None or password is None or api_url is None:
+        return None
+    api_url = api_url.rstrip("/")
+    if not ssid or not api_url.startswith(("http://", "https://")):
+        return None
+    return ssid, password, api_url
+
+
+def _draw_online_status(title, detail, color=_CREAM):
+    _chrome("PENSE BEM  ONLINE", "Q cancelar")
+    _center(title, 43, color, 2)
+    _center(detail, 82, _GRAY)
+
+
+def _release_ble_for_online():
+    """Collect Python garbage before Wi-Fi/TLS allocation.
+
+    The dedicated boot path never imports or activates Bluetooth. This is
+    intentionally not a BLE teardown: UIFlow 2.5.1 does not return NimBLE's
+    native ESP-IDF heap blocks after ``active(False)``, so teardown is already
+    too late for HTTPS on this target.
+    """
+    gc.collect()
+
+
+def _wait_retry(kb, title, detail):
+    _chrome("PENSE BEM  ONLINE", "Enter repetir  Q cancelar")
+    _center(title, 42, _RED, 2)
+    _center(detail[:36], 82, _CREAM)
+    while True:
+        ch = _next_key(kb)
+        if _is_exit(ch):
+            return False
+        if ch == "\n":
+            return True
+
+
+def _connect_wifi(kb):
+    config = _online_config()
+    if network is None or requests2 is None or config is None:
+        _wait_retry(kb, "CONFIG AUSENTE", "WiFi/API via REPL")
+        return None
+    ssid, password, api_url = config
+    sta = network.WLAN(network.STA_IF)
+    while True:
+        try:
+            if sta.isconnected():
+                return api_url
+            _draw_online_status("CONECTANDO", "WiFi da casa", _ORANGE)
+            if not sta.active():
+                sta.active(True)
+            # The launcher may have left STA active but still associated with
+            # its failed event-network attempt. Reuse a live connection, but
+            # explicitly clear a stale attempt before applying our NVS config.
+            try:
+                sta.disconnect()
+            except Exception:
+                pass
+            time.sleep_ms(500)
+            sta.connect(ssid, password)
+            started = time.ticks_ms()
+            while time.ticks_diff(time.ticks_ms(), started) < _WIFI_TIMEOUT_MS:
+                if sta.isconnected():
+                    _draw_online_status("CONECTADO", "Abrindo servidor", _GREEN)
+                    time.sleep_ms(500)
+                    return api_url
+                ch = _next_key(kb)
+                if _is_exit(ch):
+                    return None
+                try:
+                    M5.update()
+                except Exception:
+                    pass
+                time.sleep_ms(60)
+            detail = "tempo esgotado"
+        except Exception as exc:
+            detail = str(exc)[:36]
+        if not _wait_retry(kb, "SEM WIFI", detail):
+            return None
+
+
+def _server_error(payload, status):
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            code = error.get("code")
+            if isinstance(code, str) and code:
+                return code[:36]
+    return "HTTP {}".format(status)
+
+
+def _post_json(url, payload):
+    if requests2 is None:
+        raise _NetworkError("requests2 ausente")
+    response = None
+    try:
+        response = requests2.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+        )
+    except Exception as exc:
+        raise _NetworkError(str(exc)[:64])
+    try:
+        status = response.status_code
+        try:
+            body = response.json()
+        except Exception:
+            if status < 200 or status >= 300:
+                raise _ServerError("HTTP {}".format(status))
+            raise _ProtocolError("JSON invalido")
+        if status < 200 or status >= 300:
+            raise _ServerError(_server_error(body, status))
+        return body
+    finally:
+        try:
+            response.close()
+        except Exception:
+            pass
+
+
+def _post_with_retry(kb, url, payload):
+    # `payload` is created by the caller before this loop and never mutated.
+    # An answer retry therefore sends the same session, request_id and answer.
+    while True:
+        try:
+            return _post_json(url, payload)
+        except _NetworkError as exc:
+            if not _wait_retry(kb, "FALHA DE REDE", str(exc)[:36]):
+                return None
+
+
+def _request_start(kb, api_url, code):
+    payload = _start_payload(code)
+    response = _post_with_retry(
+        kb,
+        api_url + "/api/v2/atari/sessions",
+        payload,
+    )
+    if response is None:
+        return None
+    return _parse_start_response(response)
+
+
+def _request_answer(kb, api_url, session_id, request_id, answer):
+    # Load-bearing: this object is built once, outside the retry loop.
+    payload = _answer_payload(session_id, request_id, answer)
+    response = _post_with_retry(
+        kb,
+        api_url + "/api/v2/atari/sessions/answer",
+        payload,
+    )
+    if response is None:
+        return None
+    return _parse_answer_response(response, session_id, request_id)
+
+
+def _append_wrapped(lines, text, max_width):
+    _LCD.setTextSize(1)
+    for paragraph in text.split("\n"):
+        if paragraph == "":
+            if len(lines) >= _MAX_ONLINE_LINES:
+                raise _ProtocolError("texto longo demais")
+            lines.append("")
+            continue
+        line = ""
+        for character in paragraph:
+            candidate = line + character
+            if not line or _LCD.textWidth(candidate) <= max_width:
+                line = candidate
+                continue
+            split_at = line.rfind(" ")
+            if split_at > 0:
+                emitted = line[:split_at].rstrip()
+                line = line[split_at + 1:] + character
+            else:
+                emitted = line.rstrip()
+                line = character.lstrip()
+            if len(lines) >= _MAX_ONLINE_LINES:
+                raise _ProtocolError("texto longo demais")
+            lines.append(emitted)
+        if line or not lines:
+            if len(lines) >= _MAX_ONLINE_LINES:
+                raise _ProtocolError("texto longo demais")
+            lines.append(line.rstrip())
+
+
+def _online_question_lines(question):
+    lines = []
+    _append_wrapped(lines, question["text"], _W - 12)
+    if len(lines) >= _MAX_ONLINE_LINES:
+        raise _ProtocolError("texto longo demais")
+    lines.append("")
+    for index, option in enumerate(question["options"]):
+        _append_wrapped(
+            lines,
+            "{}) {}".format(chr(65 + index), option),
+            _W - 12,
+        )
+    return lines
+
+
+def _draw_online_question(question, lines, page):
+    pages = (len(lines) + _ONLINE_PAGE_LINES - 1) // _ONLINE_PAGE_LINES
+    title = "ONLINE Q{:02d}/{:02d}".format(
+        question["position"],
+        question["total"],
+    )
+    _chrome(title, "; . pagina  A-D responder")
+    status = "T{}/3".format(question["attempt"])
+    if pages > 1:
+        status += " {}/{}".format(page + 1, pages)
+    _LCD.setTextSize(1)
+    _LCD.setTextColor(
+        _GRAY if question["attempt"] == 1 else _ORANGE,
+        _DARK,
+    )
+    _LCD.drawString(status, _W - _LCD.textWidth(status) - 6, 5)
+    first = page * _ONLINE_PAGE_LINES
+    y = 24
+    for line in lines[first:first + _ONLINE_PAGE_LINES]:
+        is_option = len(line) > 2 and line[0] in "ABCD" and line[1] == ")"
+        _LCD.setTextColor(_ORANGE if is_option else _CREAM, _BLACK)
+        _LCD.drawString(line, 6, y)
+        y += 13
+
+
+def _read_online_answer(kb, question):
+    lines = _online_question_lines(question)
+    pages = (len(lines) + _ONLINE_PAGE_LINES - 1) // _ONLINE_PAGE_LINES
+    page = 0
+    _draw_online_question(question, lines, page)
+    while True:
+        ch = _next_key(kb)
+        if ch is None:
+            continue
+        if _is_exit(ch):
+            return None
+        if ch in (";", ",") and pages > 1:
+            page = (page - 1) % pages
+            _draw_online_question(question, lines, page)
+            continue
+        if ch in (".", "/") and pages > 1:
+            page = (page + 1) % pages
+            _draw_online_question(question, lines, page)
+            continue
+        choice = ch.upper()
+        if choice >= "A" and choice <= "D":
+            return choice
+
+
+def _draw_online_score(score):
+    _chrome("PENSE BEM  ONLINE", "Enter novo jogo  Q sair")
+    _center("RODADA COMPLETA", 31, _ORANGE, 2)
+    _center("PONTOS {:03d}/300".format(score), 69, _CREAM, 2)
+    _center("PLACAR DO SERVIDOR", 101, _GRAY)
+
+
+def _online_error(kb, detail):
+    _chrome("PENSE BEM  ONLINE", "Enter novo codigo  Q sair")
+    _center("ERRO ONLINE", 42, _RED, 2)
+    _center(str(detail)[:36], 82, _CREAM)
+    return _wait_continue(kb)
+
+
+def _play_online(kb, code):
+    _release_ble_for_online()
+    api_url = _connect_wifi(kb)
+    if api_url is None:
+        return None
+    _draw_online_status("CARREGANDO", "Nova sessao", _ORANGE)
+    try:
+        state = _request_start(kb, api_url, code)
+    except (_ServerError, _ProtocolError) as exc:
+        return _online_error(kb, exc)
+    if state is None:
+        return None
+
+    session_id = state["session_id"]
+    question = state["question"]
+    request_id = 1
+    while True:
+        try:
+            answer = _read_online_answer(kb, question)
+        except _ProtocolError as exc:
+            return _online_error(kb, exc)
+        if answer is None:
+            return None
+        _draw_online_status("ENVIANDO", "request {}".format(request_id), _ORANGE)
+        try:
+            response = _request_answer(
+                kb,
+                api_url,
+                session_id,
+                request_id,
+                answer,
+            )
+        except (_ServerError, _ProtocolError) as exc:
+            return _online_error(kb, exc)
+        if response is None:
+            return None
+
+        # Advance the local request counter only after a validated response.
+        request_id += 1
+        if response["complete"]:
+            _draw_online_score(response["score"])
+            _play_sfx(_SFX_ONLINE_COMPLETE)
+            return _wait_continue(kb)
+
+        question = response["question"]
+        if response["result"] == "correct":
+            _show_feedback(
+                "CERTO",
+                "+{} PONTOS".format(response["points"]),
+                True,
+                _SFX_RIGHT,
+                _JUDGE_HOLD_MS,
+            )
+        elif response["result"] == "retry":
+            _show_feedback(
+                "ERRADO",
+                "TENTATIVA {} DE 3".format(question["attempt"]),
+                False,
+                _SFX_WRONG,
+                _JUDGE_HOLD_MS,
+            )
+        else:
+            _show_feedback(
+                "ERRADO",
+                response["message"],
+                False,
+                _SFX_REVEAL,
+                _REVEAL_HOLD_MS,
+            )
 
 
 def _load_high_score():
@@ -443,13 +980,41 @@ def run():
     kb = MatrixKeyboard()
 
     try:
+        mode = _read_mode(kb)
+        if mode is None:
+            return
         while True:
-            selected = _read_code(kb)
+            selected = _read_code(kb, mode)
             if selected is None:
                 return
-            again = _play_offline(kb, selected[0], selected[1], selected[2])
+            if mode == "offline":
+                again = _play_offline(
+                    kb,
+                    selected[0],
+                    selected[1],
+                    selected[2],
+                )
+            else:
+                again = _play_online(kb, selected[0])
             if not again:
                 return
+    except Exception as exc:
+        # Do not let the unconditional reset below erase the only useful clue.
+        # UIFlow's native USB may disappear during machine.reset() before an
+        # uncaught exception reaches the serial console, which previously made
+        # online renderer failures look like a clean return to the launcher.
+        print("pense_bem: fatal:", repr(exc))
+        try:
+            sys.print_exception(exc)
+        except Exception:
+            pass
+        try:
+            _chrome("PENSE BEM  ERRO", "Reiniciando em 8 segundos")
+            _center("ERRO INTERNO", 42, _RED, 2)
+            _center(str(exc)[:36], 82, _CREAM)
+        except Exception as screen_exc:
+            print("pense_bem: fatal screen:", repr(screen_exc))
+        time.sleep_ms(8000)
     finally:
         try:
             _LCD.fillScreen(_BLACK)

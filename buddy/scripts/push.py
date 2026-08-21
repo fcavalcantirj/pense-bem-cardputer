@@ -187,6 +187,24 @@ def main() -> int:
             sys.stderr.write("uploading {}...\n".format(name))
             _upload_file(s, src_path, name)
 
+        if "main.py" in args.files:
+            # UIFlow 2.5.1: 0 = return to /flash/main.py without its stock
+            # launcher or network phase; 2 = run network setup first.  The
+            # latter was the root cause of a physically unresponsive ADV
+            # keyboard after deployment, so every launcher push repairs the
+            # boot contract as part of the same transaction.
+            out = _paste(
+                s,
+                "import esp32\n"
+                "nvs = esp32.NVS('uiflow')\n"
+                "nvs.set_u8('boot_option', 0)\n"
+                "nvs.commit()\n"
+                "print('BOOT_OPTION_OK')\n",
+                settle=0.3,
+            )
+            if "BOOT_OPTION_OK" not in out or "Traceback" in out:
+                raise RuntimeError("boot_option update failed:\n" + out)
+
         if not args.no_reset:
             sys.stderr.write("rebooting device so main.py runs...\n")
             _paste(s, "import machine; machine.reset()\n", settle=0.5)

@@ -7,18 +7,16 @@ the bundle ships with both baked in so attendees don't have to type
 anything to get on the network.
 
 The credentials below are intentionally part of the public repo for
-the event-bundle case. To use this bundle elsewhere:
+the event-bundle case. The default launcher does not call this helper;
+networking is app-owned. To build a venue-specific variant:
 
-  - Replace ``SSID`` / ``PASSWORD`` with your own, OR
-  - Remove the ``wifi_event.connect_with_splash(...)`` call from
-    ``main.py`` to disable the auto-connect entirely.
+  - Replace ``SSID`` / ``PASSWORD`` with your own, AND
+  - Import this module and call ``connect()`` explicitly.
 
-The module deliberately does NOT touch NVS. UIFlow's startup reads
-WiFi creds from NVS keys (``ssid0``, ``pswd0``, ``net_mode``,
-etc.); we set ``boot_option=2`` to bypass UIFlow's launcher, so
-those keys may or may not be honored depending on UIFlow's exact
-boot path. Doing the connect in pure Python from our own ``main.py``
-is deterministic regardless of that.
+The module deliberately does NOT touch NVS. UIFlow's current startup defines
+``boot_option=0`` as no menu/network setup before ``main.py``; the custom
+launcher uses that mode and leaves any explicit connection to the selected
+app.
 """
 
 # --- EVENT WIFI ---------------------------------------------------------
